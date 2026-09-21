@@ -1,0 +1,5 @@
+{
+  "ffmpeg_path": "ffmpeg.exe",
+  "default_output_folder": "D:\\RecordVideo\\BigoStreamlink",
+  "stalled_threshold_seconds": 20
+}

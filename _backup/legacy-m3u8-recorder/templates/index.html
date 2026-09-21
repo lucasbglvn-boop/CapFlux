@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<title>Bigo Recorder</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <span class="brand-name">Bigo Recorder</span>
+    </div>
+    <div class="topbar-stats">
+      <div class="stat">
+        <span class="stat-value" id="statActive">0</span>
+        <span class="stat-label">đang quay</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value" id="statTotalSize">0 MB</span>
+        <span class="stat-label">tổng dung lượng</span>
+      </div>
+      <button id="stopAllBtn" class="btn btn-danger-ghost">Dừng tất cả</button>
+    </div>
+  </header>
+
+  <section class="add-panel">
+    <div class="add-row">
+      <div class="add-field add-field-label">
+        <label>Tên phòng</label>
+        <input type="text" id="roomLabel" placeholder="VD: anubdn2s">
+      </div>
+      <div class="add-field add-field-link">
+        <label>Link .m3u8</label>
+        <input type="text" id="linkText" placeholder="https://.../xxx.m3u8">
+      </div>
+      <div class="add-field add-field-folder">
+        <label>Thư mục lưu</label>
+        <div class="folder-row">
+          <input type="text" id="outputFolder" value="{{ default_output }}">
+          <button type="button" id="browseBtn" class="btn btn-outline">Duyệt...</button>
+        </div>
+      </div>
+      <div class="add-field add-field-btn">
+        <label>&nbsp;</label>
+        <button id="startBtn" class="btn btn-primary">▶ Bắt đầu quay</button>
+      </div>
+    </div>
+    <div id="formError" class="error"></div>
+    <p class="tip">Mẹo: mở phòng trên trình duyệt → F12 → tab Network → lọc <code>m3u8</code> → copy link đang phát rồi dán vào đây.</p>
+  </section>
+
+  <section class="list-section">
+    <div id="emptyState" class="empty-state">
+      <p>Chưa có phòng nào đang quay.</p>
+      <p class="empty-sub">Điền thông tin phía trên và bấm "Bắt đầu quay" để bắt đầu.</p>
+    </div>
+    <div id="sessionList" class="session-list"></div>
+  </section>
+
+  <section class="log-section">
+    <div class="log-header">
+      <span>Log <span id="logRoomName" class="log-room"></span></span>
+    </div>
+    <pre id="logBox">Bấm vào một phòng trong danh sách để xem log chi tiết...</pre>
+  </section>
+
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
