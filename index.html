@@ -103,6 +103,7 @@ select.sel{height:34px;padding:0 26px 0 10px;border-radius:8px;background:var(--
 .card:hover{border-color:var(--line2)}
 .card.rec{border-color:var(--acc-line)}
 .card.live{border-color:rgba(52,211,153,.4)}
+.card.restrict{border-color:rgba(251,191,36,.45)}
 .card-top{display:flex;align-items:center;gap:11px}
 .av{position:relative;width:44px;height:44px;flex-shrink:0}
 .av img,.av .ini{width:44px;height:44px;border-radius:10px;object-fit:cover;border:1px solid var(--line)}
@@ -115,7 +116,10 @@ select.sel{height:34px;padding:0 26px 0 10px;border-radius:8px;background:var(--
 .badge.rec{background:var(--acc-dim);color:var(--acc);border:1px solid var(--acc-line);animation:pulse 1.6s infinite}
 .badge.live{background:var(--ok-dim);color:var(--ok);border:1px solid rgba(52,211,153,.35)}
 .badge.off{background:var(--panel2);color:var(--mut);border:1px solid var(--line)}
+.badge.warn{background:rgba(251,191,36,.13);color:var(--warn);border:1px solid rgba(251,191,36,.4)}
 .stitle{font-size:12px;color:var(--dim);background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hint{font-size:11.5px;line-height:1.5;color:var(--warn);background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.3);border-radius:8px;padding:7px 9px}
+.hint b{color:var(--text)}
 .metrics{display:flex;gap:6px;flex-wrap:wrap}
 .metric{font-family:var(--mono);font-size:10.5px;color:var(--dim);background:var(--acc-dim);border:1px solid var(--acc-line);border-radius:6px;padding:3px 7px}
 .cact{display:flex;align-items:center;justify-content:space-between;border-top:1px solid var(--line);padding-top:10px;
@@ -253,6 +257,7 @@ select.sel{height:34px;padding:0 26px 0 10px;border-radius:8px;background:var(--
       </button>
     </div>
     <div class="scroll">
+      <div id="cookieBanner"></div>
       <div id="chanEmpty"></div>
       <div class="cols" id="chanCols">
         <section class="col" id="colTikTok">
@@ -359,7 +364,8 @@ select.sel{height:34px;padding:0 26px 0 10px;border-radius:8px;background:var(--
         <div class="sgroup" id="pane-cookies" style="display:none">
           <h3>Cookies</h3>
           <div class="sbox">
-            <div class="srow"><div class="lbl"><b>File cookies đang dùng</b><span>Cho stream giới hạn tuổi hoặc cần đăng nhập</span></div><select class="sel" id="in-cookies" style="min-width:140px"><option value="">Không dùng</option></select></div>
+            <div class="srow"><div class="lbl"><b>File cookies đang dùng</b><span>Cho stream giới hạn tuổi hoặc cần đăng nhập</span></div><select class="sel" id="in-cookies" style="min-width:140px" onchange="saveSettings()"><option value="">Không dùng</option></select></div>
+            <div id="cookieWarn"></div>
             <div class="srow" style="flex-direction:column;align-items:stretch;gap:10px">
               <div class="lbl"><b>Tải lên</b><span>File cookies.txt (định dạng Netscape) xuất từ extension trình duyệt</span></div>
               <label class="btn btn-ghost" style="cursor:pointer;justify-content:center">Chọn file<input type="file" accept=".txt" style="display:none" onchange="upCookies(this)"></label>
@@ -511,8 +517,12 @@ function card(ch){
   const mon=ch.monitoring===true;
   const name=ch.display_name||ch.raw_id||ch.platform||'Phòng';
   const ini=(name[0]||'?').toUpperCase();
-  const badge=isRec?'rec':(!mon?'off':ch.is_live?'live':'off');
-  const badgeText=isRec?'REC':!mon?'CHƯA THEO DÕI':ch.is_live?'LIVE':'CHỜ LIVE';
+  // "restricted" = the room IS live but TikTok will not hand out its stream
+  // (private / login wall).  Shown apart from a plain LIVE so the badge never
+  // promises a recording that cannot happen.
+  const rstr=mon&&ch.is_live&&ch.restricted===true;
+  const badge=isRec?'rec':(!mon?'off':ch.is_live?(rstr?'warn':'live'):'off');
+  const badgeText=isRec?'REC':!mon?'CHƯA THEO DÕI':ch.is_live?(rstr?'LIVE ⚠':'LIVE'):'CHỜ LIVE';
   let primary;
   if(isRec){
     primary=`<button class="btn recbtn stop" onclick="stopCh('${ch.id}')"><svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>Dừng quay</button>`;
@@ -521,7 +531,7 @@ function card(ch){
   }else{
     primary=`<button class="btn recbtn" onclick="watchCh('${ch.id}')"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 4l13 8-13 8z"/></svg>Bắt đầu theo dõi</button>`;
   }
-  return `<div class="card ${isRec?'rec':ch.is_live&&mon?'live':''}">
+  return `<div class="card ${isRec?'rec':rstr?'restrict':ch.is_live&&mon?'live':''}">
   <div class="card-top">
     <div class="av">
       ${ch.avatar?`<img src="${esc(ch.avatar)}" onerror="this.style.display='none';this.nextElementSibling.style.display='grid'" alt="">`:''}
@@ -529,12 +539,13 @@ function card(ch){
       <div class="plat">${platEmoji(ch.platform)}</div>
     </div>
     <div class="cinfo"><div class="cname">${esc(name)}</div><div class="csub">${esc(ch.platform||'')}${ch.raw_id?' · ID '+esc(ch.raw_id):''} · ${mon?ago(ch.last_checked):'không kiểm tra'}</div></div>
-    <span class="badge ${badge}">${badgeText}</span>
+    <span class="badge ${badge}"${rstr?' title="Phòng đang live nhưng TikTok không cấp link stream (live riêng tư / cần đăng nhập)"':''}>${badgeText}</span>
   </div>
   ${ch.stream_title?`<div class="stitle" title="${esc(ch.stream_title)}">${esc(ch.stream_title)}</div>`:''}
+  ${rstr?`<div class="hint">TikTok không cấp link stream cho phòng này (live riêng tư hoặc phải đăng nhập). Thêm cookies TikTok đã đăng nhập ở <b>Cài đặt → Cookies</b>, rồi bấm nút <b>Quay ngay</b> để thử lại.</div>`:''}
   ${isRec?`<div class="metrics"><span class="metric">⏱ ${fmtSince(ch.rec_started)}</span><span class="metric">⚡ ${esc(ch.rec_speed||'—')}</span><span class="metric">💾 ${fmtB(ch.rec_bytes)}</span></div>`:''}
   <div class="cact">
-    <div class="cact-l">${mon?(ch.is_live?'Đang live':'Đang chờ live · quét mỗi '+checkSec+'s'):'Chưa theo dõi'}</div>
+    <div class="cact-l">${mon?(ch.is_live?(rstr?'Live nhưng bị TikTok hạn chế':'Đang live'):'Đang chờ live · quét mỗi '+checkSec+'s'):'Chưa theo dõi'}</div>
     <div class="cact-r">
       ${mon&&!isRec?`<button class="ibtn" title="Quay ngay" style="color:var(--acc)" onclick="recCh('${ch.id}')"><svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="7"/></svg></button>`:''}
       <button class="ibtn" title="Nhật ký" onclick="openLog('${ch.id}')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 10h16M4 14h16M4 18h10"/></svg></button>
@@ -556,6 +567,19 @@ function laneOf(platform){
   if(s.includes('bigo'))return'bigo';
   return'other';
 }
+/* Rooms TikTok keeps behind a login wall can only be recorded with a logged-in
+   cookie jar.  Say so once at the top of the board instead of leaving the user
+   to work it out from failed cards. */
+function renderCookieBanner(items){
+  const box=$('cookieBanner');
+  if(!box)return;
+  const bad=items.filter(c=>c.is_live&&c.restricted===true);
+  if(!bad.length||settings.cookies_file){box.innerHTML='';return}
+  box.innerHTML=`<div class="hint" style="margin-bottom:14px;display:flex;align-items:center;gap:10px">
+    <span style="flex:1">${bad.length} phòng đang LIVE nhưng TikTok không cấp link stream (live riêng tư / phải đăng nhập). Cần <b>cookies TikTok đã đăng nhập</b> mới quay được.</span>
+    <button class="btn btn-ghost" onclick="switchView('settings');setPane('cookies',document.querySelector('button[data-pane=cookies]'))">Mở Cài đặt → Cookies</button>
+  </div>`;
+}
 function renderChannels(){
   const q=($('q').value||'').toLowerCase();
   const s=$('sortSel').value;
@@ -565,6 +589,7 @@ function renderChannels(){
   // Nothing saved at all -> show the onboarding message instead of empty lanes
   if(!all.length){
     cols.style.display='none';
+    $('cookieBanner').innerHTML='';
     emptyBox.innerHTML=`<div class="empty"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 7V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2"/></svg><b>Chưa có phòng nào</b><span>Bấm <b>Thêm phòng</b> rồi nhập ID phòng Bigo — ví dụ <code>123456789</code>.<br>Không cần tìm link <code>.m3u8</code> nữa.</span></div>`;
     return;
   }
@@ -576,6 +601,7 @@ function renderChannels(){
   });
   const cmp={name:(a,b)=>(a.display_name||'').localeCompare(b.display_name||''),platform:(a,b)=>(a.platform||'').localeCompare(b.platform||''),recent:(a,b)=>b.created_at-a.created_at,live:(a,b)=>((b.is_live||0)-(a.is_live||0))||b.created_at-a.created_at,custom:(a,b)=>(a.sort_order??9999)-(b.sort_order??9999)};
   list.sort(cmp[s]||cmp.custom);
+  renderCookieBanner(all);
 
   let anyLive=false;
   for(const L of LANES){
@@ -761,6 +787,12 @@ async function saveSettings(){
       retry_delay:+$('in-retrydelay').value||15,webhook_url:$('in-webhook').value.trim(),
       cookies_file:$('in-cookies').value,
     })});
+    // Keep the in-memory copy in step, then refresh everything that depends on
+    // it: the "chưa chọn file cookies" warning here and the board banner that
+    // tells the user a restricted TikTok room needs cookies.
+    settings.cookies_file=$('in-cookies').value;
+    loadCookies();
+    renderCookieBanner(Object.values(channels));
     toast('Đã lưu cài đặt');fetchSlots();fetchPoll();
   }catch(e){toast(e.message,true)}
 }
@@ -768,9 +800,67 @@ async function fetchDisk(){try{const d=await api('/api/disk');$('diskText').text
 async function testHook(){try{await api('/api/settings/test-webhook',{method:'POST'});toast('Đã gửi thử')}catch(e){toast(e.message,true)}}
 
 /* cookies */
-async function loadCookies(){try{const f=await api('/api/cookies');$('in-cookies').innerHTML='<option value="">Không dùng</option>'+f.map(x=>`<option value="${esc(x.filename)}">${esc(x.filename)}</option>`).join('');if(settings.cookies_file)$('in-cookies').value=settings.cookies_file;$('cookieList').innerHTML=f.map(x=>`<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--line);font-family:var(--mono);font-size:11px"><span>${esc(x.filename)}</span><button class="ibtn" style="color:var(--acc)" onclick="delCookie('${esc(x.filename)}')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="12" height="12"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>`).join('')}catch{}}
-async function upCookies(inp){const f=inp.files[0];if(!f)return;const fd=new FormData();fd.append('file',f);try{await api('/api/cookies/upload',{method:'POST',body:fd});toast('Đã tải lên');loadCookies()}catch(e){toast(e.message,true)}inp.value=''}
-async function delCookie(n){try{await api(`/api/cookies/${encodeURIComponent(n)}`,{method:'DELETE'});loadCookies()}catch(e){toast(e.message,true)}}
+/* A cookie file that is uploaded but NOT selected in "File cookies đang dùng"
+   is silently unused — the tool keeps talking to TikTok as a guest and a
+   restricted room stays unrecordable.  loadCookies therefore keeps the current
+   selection, and warns whenever files exist but none is chosen. */
+async function loadCookies(selectName){
+  try{
+    const f=await api('/api/cookies');
+    const want=selectName||$('in-cookies').value||settings.cookies_file||'';
+    $('in-cookies').innerHTML='<option value="">Không dùng</option>'+f.map(x=>`<option value="${esc(x.filename)}">${esc(x.filename)}</option>`).join('');
+    $('in-cookies').value=f.some(x=>x.filename===want)?want:'';
+    settings.cookies_file=$('in-cookies').value;
+    const warn=$('cookieWarn');
+    if(warn){
+      warn.innerHTML=(f.length&&!settings.cookies_file)
+        ? `<div class="hint" style="margin-top:9px">Đã có ${f.length} file cookies nhưng <b>chưa chọn file nào</b> — tool vẫn truy cập TikTok như khách. Chọn 1 file ở ô trên để dùng.</div>`
+        : '';
+    }
+    $('cookieList').innerHTML=f.map(x=>`<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--line);font-family:var(--mono);font-size:11px"><span>${esc(x.filename)}</span><button class="ibtn" style="color:var(--acc)" onclick="delCookie('${esc(x.filename)}')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="12" height="12"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>`).join('');
+  }catch{}
+}
+/* Reading the file here gives an immediate, specific answer instead of a
+   silent failure later: a jar with no sessionid is a guest jar, and for a
+   restricted TikTok room only a logged-in one helps. */
+async function cookieFileVerdict(f){
+  try{
+    const t=await f.text();
+    const rows=t.split('\n').map(l=>l.startsWith('#HttpOnly_')?l.slice(10):l).filter(l=>l.trim()&&!l.startsWith('#'));
+    const names=rows.map(l=>l.split('\t')[5]).filter(Boolean);
+    const tt=rows.filter(l=>/tiktok/i.test(l.split('\t')[0]));
+    if(!tt.length)return{v:'bad',msg:'File không có cookie TikTok nào.'};
+    if(!names.includes('sessionid'))return{v:'bad',msg:'File thiếu cookie sessionid — đây là cookies khách, chưa đăng nhập TikTok.'};
+    return{v:'ok',msg:`Cookies TikTok đã đăng nhập (${tt.length} cookie).`};
+  }catch{return{v:'ok',msg:''}}
+}
+async function upCookies(inp){
+  const f=inp.files[0];if(!f)return;
+  const verdict=await cookieFileVerdict(f);
+  const fd=new FormData();fd.append('file',f);
+  try{
+    const r=await api('/api/cookies/upload',{method:'POST',body:fd});
+    // Select it and persist straight away: uploading is the user's way of
+    // saying "use this", and leaving the dropdown on "Không dùng" is exactly
+    // what made the upload look like it had worked.
+    settings.cookies_file=r.filename;
+    await api('/api/settings',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookies_file:r.filename})});
+    await loadCookies(r.filename);
+    toast(verdict.msg||('Đã tải lên '+r.filename),verdict.v==='bad');
+    if(verdict.v!=='bad'){fetchChannels();toast('Đang dùng '+r.filename+' — bấm "Quay ngay" trên phòng để thử lại')}
+  }catch(e){toast(e.message,true)}
+  inp.value='';
+}
+async function delCookie(n){
+  try{
+    await api(`/api/cookies/${encodeURIComponent(n)}`,{method:'DELETE'});
+    if(settings.cookies_file===n){
+      settings.cookies_file='';
+      await api('/api/settings',{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({cookies_file:''})});
+    }
+    loadCookies();
+  }catch(e){toast(e.message,true)}
+}
 
 /* yt-dlp */
 async function fetchYd(){try{const d=await api('/api/ytdlp-version');$('ydVer').textContent='Phiên bản: '+d.current+(d.latest===d.current?' (mới nhất)':'')}catch{$('ydVer').textContent='không rõ'}}
@@ -789,7 +879,10 @@ function startPoll(){if(pollTimer)clearInterval(pollTimer);pollTimer=setInterval
 },5000)}
 
 /* init */
-(async()=>{await Promise.allSettled([fetchChannels(),fetchSlots(),fetchPoll(),loadStorage()]);startPoll()})();
+/* Settings are loaded up front (not only when the Settings view opens) because
+   the board needs settings.cookies_file to decide whether the "needs cookies"
+   banner is still relevant.  renderChannels then runs once the answers are in. */
+(async()=>{await Promise.allSettled([fetchChannels(),fetchSlots(),fetchPoll(),loadSettingsUI()]);renderChannels();startPoll()})();
 </script>
 </body>
 </html>

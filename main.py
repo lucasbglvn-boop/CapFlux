@@ -547,7 +547,9 @@ def _save_state_sync():
     saved_channels = {}
     for cid, ch in list(channels.items()):
         c = dict(ch)
-        for k in ("recording_id", "is_live", "last_checked"):
+        # Runtime-only flags — a fresh check repopulates them after a restart.
+        for k in ("recording_id", "is_live", "last_checked",
+                  "restricted", "restricted_until"):
             c.pop(k, None)
         # Strip sensitive credentials from disk-persisted state
         for k in ("ch_password",):
@@ -593,6 +595,8 @@ def _load_state():
             ch["recording_id"] = None
             ch["is_live"]      = False
             ch["last_checked"] = None
+            ch.pop("restricted", None)
+            ch.pop("restricted_until", None)
             # Re-detect platform for any channels saved as Unknown
             if ch.get("platform") in ("Unknown", "", None) and ch.get("url"):
                 ch["platform"] = detect_platform(ch["url"])
@@ -977,11 +981,140 @@ _TIKTOK_UA = (
     " (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
+# Some rooms are live but TikTok refuses to hand an anonymous client the stream
+# url: /webcast/room/info/ answers 4003110 and /webcast/room/check_alive/ still
+# says alive.  That is a *login/private* wall on the room, not an offline room
+# and not something retrying fixes — the only lever is a logged-in cookie jar
+# (the first project that documented the code calls it "Live is private, login
+# required").  Retrying such a room every monitor tick produced a fresh failed
+# recording every minute, so back off once detected.
+TIKTOK_RESTRICTED_CODE     = 4003110
+TIKTOK_RESTRICTED_COOLDOWN = 600   # seconds between attempts on such a room
+
 # One shared, cookie-carrying session: a solved challenge is reused for every
 # room and re-solved automatically whenever TikTok asks again.  HTTP sessions
 # are not thread-safe, so all access is serialised by this lock.
 _tiktok_lock: asyncio.Lock = asyncio.Lock()
 _tiktok_session = None
+# Path of the Netscape jar currently loaded into that session, so switching
+# cookie files rebuilds the identity instead of silently reusing the old one.
+_tiktok_cookies_loaded: str = ""
+
+
+def _resolve_cookie_file(ch: Optional[dict] = None) -> str:
+    """Cookie jar for a channel: its own, else the global setting.
+
+    Mirrors the resolution the yt-dlp half of a recording already gets, so both
+    halves of a TikTok recording speak as the same user.  Returns "" when no
+    usable file is configured.
+    """
+    name = ((ch or {}).get("cookies_file") or settings.get("cookies_file") or "").strip()
+    if not name:
+        return ""
+    path = Path(name)
+    if not path.is_absolute():
+        path = COOKIES_DIR / name
+    if not path.exists():
+        logger.debug("Configured cookies file not found: %s", path)
+        return ""
+    return str(path)
+
+
+def _load_netscape_cookies(path: str) -> int:
+    """Copy a cookies.txt into the shared TikTok session.  Returns the count.
+
+    `#HttpOnly_` lines are real cookies, not comments — that is exactly how
+    browsers export them — so they must not be skipped.
+    """
+    if _tiktok_session is None:
+        return 0
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        logger.warning("Cannot read cookies file %s: %s", path, e)
+        return 0
+    count = 0
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        elif line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 7:
+            continue
+        domain, _flag, cpath, _secure, _expires, name, value = parts[:7]
+        if "tiktok" not in domain.lower():
+            continue
+        try:
+            _tiktok_session.cookies.set(name, value,
+                                        domain=domain, path=cpath or "/")
+            count += 1
+        except Exception:
+            pass
+    return count
+
+
+def _tiktok_ensure_session(cookies_file: str = "") -> bool:
+    """Create the shared session, loading the cookie jar when it changed.
+
+    Blocking; worker threads only.  Returns False when neither curl_cffi nor
+    requests is importable.
+    """
+    global _tiktok_session, _tiktok_cookies_loaded
+    # A different jar means a different identity: drop the session so any WAF
+    # challenge is solved again with the logged-in cookies already in place.
+    if cookies_file != _tiktok_cookies_loaded:
+        _tiktok_session = None
+        _tiktok_cookies_loaded = cookies_file
+    if _tiktok_session is not None:
+        return True
+    if _curl_cffi is not None:
+        _tiktok_session = _curl_cffi.Session(impersonate="chrome")
+    elif _requests is not None:
+        _tiktok_session = _requests.Session()
+        _tiktok_session.headers.update({"User-Agent": _TIKTOK_UA})
+    else:
+        return False
+    if cookies_file:
+        n = _load_netscape_cookies(cookies_file)
+        logger.info("TikTok session now carries %d cookie(s) from %s",
+                    n, Path(cookies_file).name)
+    return True
+
+
+def _tiktok_check_alive(room_id: str, proxy: str = "",
+                        cookies_file: str = "") -> Optional[bool]:
+    """Authoritative "is this room live?" for a room id (None = unknown).
+
+    Unlike /webcast/room/info/, this endpoint still answers for rooms TikTok
+    keeps behind a login wall, so a restricted-but-live room is never
+    mislabelled as offline.  Blocking; worker threads only.
+    """
+    if not room_id or _tiktok_session is None:
+        return None
+    kwargs: dict = {
+        "params": {"aid": "1988", "region": "CH", "room_ids": room_id,
+                   "user_is_login": "true"},
+        "timeout": 25,
+    }
+    if proxy:
+        kwargs["proxies"] = {"http": proxy, "https": proxy}
+    try:
+        data = _tiktok_session.get(
+            "https://webcast.tiktok.com/webcast/room/check_alive/",
+            **kwargs).json() or {}
+    except Exception as e:
+        logger.debug("tiktok check_alive failed for %s: %s", room_id, e)
+        return None
+    if data.get("status_code") not in (0, None):
+        return None
+    rows = data.get("data")
+    if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+        return None
+    return bool(rows[0].get("alive"))
 
 
 def _tiktok_solve_challenge(html: str) -> Optional[tuple]:
@@ -1041,10 +1174,11 @@ def _tiktok_fetch_once(url: str, kwargs: dict) -> str:
     return html
 
 
-def _tiktok_session_get(url: str, proxy: str = "") -> str:
+def _tiktok_session_get(url: str, proxy: str = "", cookies_file: str = "") -> str:
     """GET a tiktok.com page, answering the WAF challenge when one is served.
 
-    Blocking — call it from a worker thread only.  Returns "" on any failure.
+    `cookies_file` is a Netscape jar (already resolved) used for rooms that need
+    a logged-in identity.  Blocking — worker threads only.  "" on any failure.
     """
     global _tiktok_session
     kwargs: dict = {"timeout": 25}
@@ -1053,14 +1187,8 @@ def _tiktok_session_get(url: str, proxy: str = "") -> str:
 
     html = ""
     for _ in range(2):
-        if _tiktok_session is None:
-            if _curl_cffi is not None:
-                _tiktok_session = _curl_cffi.Session(impersonate="chrome")
-            elif _requests is not None:
-                _tiktok_session = _requests.Session()
-                _tiktok_session.headers.update({"User-Agent": _TIKTOK_UA})
-            else:
-                return ""
+        if not _tiktok_ensure_session(cookies_file):
+            return ""
         html = _tiktok_fetch_once(url, kwargs)
         if "SIGI_STATE" in html or "__UNIVERSAL_DATA_FOR_REHYDRATION__" in html:
             return html
@@ -1127,12 +1255,18 @@ def _tiktok_hls_from_room_info(data: dict) -> str:
 
 
 def _tiktok_room_info_blocking(url: str, proxy: str = "",
-                               want_stream: bool = False) -> Optional[dict]:
+                               want_stream: bool = False,
+                               cookies_file: Optional[str] = None) -> Optional[dict]:
     """Resolve a TikTok room's live state, and its HLS url when asked.
 
     Returns None only when the state could not be determined at all, so callers
-    can tell "definitely offline" apart from "could not tell".
+    can tell "definitely offline" apart from "could not tell".  A live room that
+    TikTok will not hand a stream url to (`restricted`) is still reported live,
+    with `restricted=True`, so the caller can say *why* it cannot record instead
+    of claiming the room is broken.
     """
+    if cookies_file is None:
+        cookies_file = _resolve_cookie_file(None)
     handle = ""
     try:
         handle = _tiktok_handle_from_url(urlparse(url).path)
@@ -1144,7 +1278,8 @@ def _tiktok_room_info_blocking(url: str, proxy: str = "",
     if not handle:
         return None
 
-    html  = _tiktok_session_get(f"https://www.tiktok.com/@{handle}/live", proxy)
+    html  = _tiktok_session_get(f"https://www.tiktok.com/@{handle}/live", proxy,
+                                cookies_file)
     state = _tiktok_page_state(html)
     if state is None:
         if "SIGI_STATE" in html:
@@ -1165,14 +1300,15 @@ def _tiktok_room_info_blocking(url: str, proxy: str = "",
     # a non-empty roomId on its own does NOT mean the room is live.
     is_live   = (status == TIKTOK_LIVE_STATUS) if status is not None else bool(room_id)
     info = {
-        "live":     is_live,
-        "room_id":  room_id,
-        "handle":   user.get("uniqueId") or handle,
-        "nickname": user.get("nickname") or "",
-        "avatar":   (user.get("avatarLarger") or user.get("avatarMedium")
-                     or user.get("avatarThumb") or ""),
-        "title":    (live_room.get("title") or "").strip(),
-        "hls":      "",
+        "live":       is_live,
+        "restricted": False,
+        "room_id":    room_id,
+        "handle":     user.get("uniqueId") or handle,
+        "nickname":   user.get("nickname") or "",
+        "avatar":     (user.get("avatarLarger") or user.get("avatarMedium")
+                       or user.get("avatarThumb") or ""),
+        "title":      (live_room.get("title") or "").strip(),
+        "hls":        "",
     }
     if not (want_stream and is_live and room_id):
         return info
@@ -1180,31 +1316,53 @@ def _tiktok_room_info_blocking(url: str, proxy: str = "",
     kwargs: dict = {"params": {"aid": "1988", "room_id": room_id}, "timeout": 25}
     if proxy:
         kwargs["proxies"] = {"http": proxy, "https": proxy}
+    payload: dict = {}
     try:
-        data = (_tiktok_session.get(
-            "https://webcast.tiktok.com/webcast/room/info/", **kwargs).json()
-            or {}).get("data") or {}
+        payload = _tiktok_session.get(
+            "https://webcast.tiktok.com/webcast/room/info/", **kwargs).json() or {}
     except Exception as e:
         logger.debug("tiktok room/info failed for %s: %s", handle, e)
+
+    code = payload.get("status_code") or 0
+    data = payload.get("data") or {}
+    if code == TIKTOK_RESTRICTED_CODE:
+        # Live, but TikTok will not serve this client its stream: a login /
+        # private wall on the room, not a broken room and not something a retry
+        # fixes.  check_alive confirms it so a stale `status` cannot fake one.
+        alive = _tiktok_check_alive(room_id, proxy, cookies_file)
+        info["restricted"] = True
+        info["live"] = True if alive is None else bool(alive)
+        logger.info(
+            "TikTok room %s is live but restricted (code %d)%s", handle,
+            TIKTOK_RESTRICTED_CODE,
+            "" if cookies_file else " — needs logged-in TikTok cookies to record")
         return info
-    if data:
-        if data.get("status") is not None:
-            try:
-                info["live"] = int(data["status"]) == TIKTOK_LIVE_STATUS
-            except (TypeError, ValueError):
-                pass
-        info["hls"] = _tiktok_hls_from_room_info(data)
-        if not info["title"]:
-            info["title"] = (data.get("title") or "").strip()
+    if not data:
+        # No payload at all: ask the dedicated endpoint rather than guessing.
+        alive = _tiktok_check_alive(room_id, proxy, cookies_file)
+        if alive is not None:
+            info["live"] = bool(alive)
+        logger.debug("tiktok room %s: room/info had no payload (code=%s, alive=%s)",
+                     handle, code, alive)
+        return info
+    if data.get("status") is not None:
+        try:
+            info["live"] = int(data["status"]) == TIKTOK_LIVE_STATUS
+        except (TypeError, ValueError):
+            pass
+    info["hls"] = _tiktok_hls_from_room_info(data)
+    if not info["title"]:
+        info["title"] = (data.get("title") or "").strip()
     return info
 
 
 async def tiktok_room_info(url: str, proxy: str = "",
-                           want_stream: bool = False) -> Optional[dict]:
+                           want_stream: bool = False,
+                           cookies_file: Optional[str] = None) -> Optional[dict]:
     """Async front end for the blocking TikTok resolver above."""
     async with _tiktok_lock:
         return await asyncio.get_running_loop().run_in_executor(
-            None, _tiktok_room_info_blocking, url, proxy, want_stream)
+            None, _tiktok_room_info_blocking, url, proxy, want_stream, cookies_file)
 
 
 async def _check_chaturbate_live(url: str, proxy: str = "") -> Optional[bool]:
@@ -1466,7 +1624,8 @@ async def run_recording(rec_id: str):
     if platform == "tiktok":
         _tt_proxy = ch.get("proxy") or settings.get("proxy", "")
         try:
-            _tt_info = await tiktok_room_info(url, proxy=_tt_proxy, want_stream=True)
+            _tt_info = await tiktok_room_info(url, proxy=_tt_proxy, want_stream=True,
+                                              cookies_file=_resolve_cookie_file(ch))
         except Exception as e:
             _tt_info = None
             logger.warning("TikTok resolve failed for %s: %s", rec_id, e)
@@ -1479,7 +1638,14 @@ async def run_recording(rec_id: str):
         if not _tt_hls:
             rec["status"]   = "error"
             rec["ended_at"] = time.time()
-            if _tt_info is None:
+            _tt_restricted = bool(_tt_info and _tt_info.get("restricted"))
+            if _tt_restricted:
+                rec["error"] = (
+                    "TikTok: phòng đang LIVE nhưng bị TikTok giới hạn (live riêng "
+                    "tư / phải đăng nhập) nên không trả link stream. Thêm cookies "
+                    "TikTok đã đăng nhập ở Cài đặt → Cookies rồi thử lại."
+                )
+            elif _tt_info is None:
                 rec["error"] = ("TikTok: không đọc được trạng thái phòng "
                                 "(TikTok chặn truy cập). Thử quay lại sau.")
             elif _tt_info.get("live"):
@@ -1487,16 +1653,34 @@ async def run_recording(rec_id: str):
                                 "link stream. Thử quay lại sau ít phút.")
             else:
                 rec["error"] = "TikTok: phòng đang offline."
-            logger.warning("TikTok recording %s aborted — no HLS url (info=%s)",
-                           rec_id, bool(_tt_info))
+            if _tt_restricted:
+                rec.setdefault("log", []).append(
+                    f"[TOOL] TikTok không cấp link stream cho phòng này (mã "
+                    f"{TIKTOK_RESTRICTED_CODE}) — tạm ngừng thử lại trong "
+                    f"{TIKTOK_RESTRICTED_COOLDOWN // 60} phút. Thêm cookies TikTok "
+                    f"đã đăng nhập để quay được."
+                )
+            logger.warning("TikTok recording %s aborted — no HLS url (info=%s, restricted=%s)",
+                           rec_id, bool(_tt_info), _tt_restricted)
             if ch_id := rec.get("channel_id"):
                 ch_entry = channels.get(ch_id)
                 if ch_entry and ch_entry.get("recording_id") == rec_id:
                     ch_entry["recording_id"] = None
                     ch_entry["is_live"] = bool(_tt_info and _tt_info.get("live"))
+                    ch_entry["restricted"] = _tt_restricted
+                    if _tt_restricted:
+                        # Without this the monitor tick builds another failed
+                        # recording every minute for the same room.
+                        ch_entry["restricted_until"] = (
+                            time.time() + TIKTOK_RESTRICTED_COOLDOWN)
+                    else:
+                        ch_entry.pop("restricted_until", None)
             _save_state()
             return
         url = _tt_hls
+        if (ch_id := rec.get("channel_id")) and ch_id in channels:
+            channels[ch_id]["restricted"] = False
+            channels[ch_id].pop("restricted_until", None)
 
     # Filename = <username>_<YYYY-MM-DD>_<HH-MM-SS>, saved flat under
     # <y_storage>\<platform>.  The nickname the engine just resolved wins over
@@ -2130,19 +2314,22 @@ async def _check_one_channel(ch_id: str) -> None:
             return
 
     proxy = ch.get("proxy") or settings.get("proxy", "")
+    restricted: Optional[bool] = None
     try:
         if re.search(r"tiktok\.com", ch["url"], re.I):
             # TikTok: one native call answers both questions — the room page we
             # fetch for the live check also carries the fresh nickname, avatar
             # and title, so a card saved before the WAF work-around was known
             # ("@handle", no avatar) repairs itself here.
-            info = await tiktok_room_info(ch["url"], proxy=proxy)
+            info = await tiktok_room_info(ch["url"], proxy=proxy,
+                                          cookies_file=_resolve_cookie_file(ch))
             if info is None:
                 # Could not read the room at all — fall back rather than
                 # reporting a live room as offline.
                 is_live = await check_is_live(ch["url"], proxy=proxy)
             else:
-                is_live = bool(info.get("live"))
+                is_live    = bool(info.get("live"))
+                restricted = bool(info.get("restricted"))
                 if ch_id in channels:
                     if info.get("nickname"):
                         channels[ch_id]["display_name"] = info["nickname"]
@@ -2163,23 +2350,36 @@ async def _check_one_channel(ch_id: str) -> None:
         return
     channels[ch_id]["is_live"]      = is_live
     channels[ch_id]["last_checked"] = time.time()
+    if restricted:
+        # Only the stream probe (i.e. a recording attempt) can tell a restricted
+        # room apart from a normal one, so the flag is sticky: set by whichever
+        # call did the probe, cleared by a successful resolve.
+        channels[ch_id]["restricted"] = True
 
     if is_live and not channels[ch_id].get("recording_id"):
-        logger.info("Watched room %s is live — starting recording", ch_id)
-        try:
-            rec_id = await _start_recording_for_channel(ch_id)
-        except Exception as e:
-            logger.exception("Failed to start auto-record for %s: %s", ch_id, e)
-            return
-        if rec_id and rec_id in recordings:
-            recordings[rec_id]["auto"] = True
-            asyncio.create_task(_send_webhook("stream_live", {
-                "channel_id": ch_id,
-                "name": channels[ch_id].get("display_name", ""),
-                "url": channels[ch_id].get("url", ""),
-                "platform": channels[ch_id].get("platform", ""),
-                "recording_id": rec_id,
-            }))
+        until = channels[ch_id].get("restricted_until") or 0
+        if until > time.time():
+            # TikTok refuses to hand this room's stream over.  The card says so;
+            # the wait is what stops a new doomed recording on every tick.
+            logger.debug("Room %s is live but restricted — retrying in %.0fs",
+                         ch_id, until - time.time())
+        else:
+            channels[ch_id].pop("restricted_until", None)
+            logger.info("Watched room %s is live — starting recording", ch_id)
+            try:
+                rec_id = await _start_recording_for_channel(ch_id)
+            except Exception as e:
+                logger.exception("Failed to start auto-record for %s: %s", ch_id, e)
+                return
+            if rec_id and rec_id in recordings:
+                recordings[rec_id]["auto"] = True
+                asyncio.create_task(_send_webhook("stream_live", {
+                    "channel_id": ch_id,
+                    "name": channels[ch_id].get("display_name", ""),
+                    "url": channels[ch_id].get("url", ""),
+                    "platform": channels[ch_id].get("platform", ""),
+                    "recording_id": rec_id,
+                }))
 
 
 async def monitor_loop():
@@ -3155,7 +3355,8 @@ async def export_config():
     saved_channels = {}
     for cid, ch in channels.items():
         c = dict(ch)
-        for k in ("recording_id", "is_live", "last_checked"):
+        for k in ("recording_id", "is_live", "last_checked",
+                  "restricted", "restricted_until"):
             c.pop(k, None)
         c.pop("ch_password", None)  # never export credentials
         saved_channels[cid] = c
